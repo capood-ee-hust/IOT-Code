@@ -1,0 +1,121 @@
+#include <WiFi.h>
+#include <AsyncMQTT_ESP32.h>
+#include <esp_wifi.h> 
+
+const char* ssid = "DESKTOP-8CAC5FU 7464"; 
+const char* password = "^63Le203"; 
+
+
+IPAddress mqtt_server(192, 168, 137, 1); 
+const int mqtt_port = 1883;
+
+AsyncMqttClient mqttClient;
+TimerHandle_t mqttReconnectTimer;
+TimerHandle_t wifiReconnectTimer;
+
+typedef struct {
+  int16_t fctl;
+  int16_t duration;
+  uint8_t mac1[6]; // Receiver Address (RA)
+  uint8_t mac2[6]; // Transmitter Address (TA) - MAC Nguồn
+  uint8_t mac3[6]; // BSSID
+  int16_t seqctl;
+} __attribute__((packed)) WifiMgmtHdr;
+
+volatile bool hasPacket = false;
+String snifferData = "";
+unsigned long lastSentTime = 0;
+
+
+void IRAM_ATTR sniffer_callback(void* buf, wifi_promiscuous_pkt_type_t type) {
+  if (hasPacket) return;
+  wifi_promiscuous_pkt_t* pkt = (wifi_promiscuous_pkt_t*)buf;
+  WifiMgmtHdr* wh = (WifiMgmtHdr*)pkt->payload;
+
+  if (type != WIFI_PKT_MGMT && type != WIFI_PKT_DATA) return;
+
+  int rssi = pkt->rx_ctrl.rssi;
+  
+  if (rssi < -80) return;
+
+  char macSrc[18];
+  char macDst[18];
+  
+  snprintf(macSrc, sizeof(macSrc), "%02x:%02x:%02x:%02x:%02x:%02x",
+           wh->mac2[0], wh->mac2[1], wh->mac2[2], wh->mac2[3], wh->mac2[4], wh->mac2[5]);
+           
+  snprintf(macDst, sizeof(macDst), "%02x:%02x:%02x:%02x:%02x:%02x",
+           wh->mac1[0], wh->mac1[1], wh->mac1[2], wh->mac1[3], wh->mac1[4], wh->mac1[5]);
+
+  snifferData = "{\"type\":\"L2_FRAME\", \"src\":\"" + String(macSrc) + 
+                "\", \"dst\":\"" + String(macDst) + 
+                "\", \"rssi\":" + String(rssi) + "}";
+
+  hasPacket = true; // Bật cờ báo hiệu cho vòng loop() biết
+}
+
+void connectToWifi() {
+  Serial.println("Connecting to Wi-Fi...");
+  WiFi.begin(ssid, password);
+}
+
+void connectToMqtt() {
+  Serial.println("Connecting to MQTT Local...");
+  mqttClient.connect();
+}
+
+void onWifiConnect(WiFiEvent_t event) {
+  Serial.println("WiFi Connected.");
+  connectToMqtt();
+  
+  esp_wifi_set_promiscuous_rx_cb(&sniffer_callback);
+  // Bật chế độ Promiscuous
+  esp_wifi_set_promiscuous(true);
+  Serial.println("Promiscuous Mode: ON (Sniffing Layer 2 Frames)");
+}
+
+void onWifiDisconnect(WiFiEvent_t event) {
+  Serial.println("WiFi Disconnected");
+  xTimerStart(wifiReconnectTimer, 0);
+}
+
+void onMqttConnect(bool sessionPresent) {
+  Serial.println("Connected to Local Broker.");
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
+  Serial.println("MQTT Disconnected");
+  if (WiFi.isConnected()) xTimerStart(mqttReconnectTimer, 0);
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, [](TimerHandle_t) { connectToMqtt(); });
+  wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void*)0, [](TimerHandle_t) { connectToWifi(); });
+
+  WiFi.onEvent(onWifiConnect, ARDUINO_EVENT_WIFI_STA_GOT_IP);
+  WiFi.onEvent(onWifiDisconnect, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
+
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.onConnect(onMqttConnect);
+  mqttClient.onDisconnect(onMqttDisconnect);
+
+  connectToWifi();
+}
+
+void loop() {
+  if (hasPacket && mqttClient.connected()) {
+
+    if (millis() - lastSentTime > 200) {
+
+      mqttClient.publish("esp32/sniffer", 0, false, snifferData.c_str());
+
+      Serial.print("Forwarding Layer 2: ");
+      Serial.println(snifferData);
+      
+      lastSentTime = millis();
+      hasPacket = false; // Reset cờ, sẵn sàng bắt gói mới
+    }
+  }
+}
